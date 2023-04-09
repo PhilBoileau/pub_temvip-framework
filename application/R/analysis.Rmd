@@ -1,0 +1,287 @@
+---
+title: "Predictive Biomarker Analysis: FinHER Trial"
+author: "Philippe Boileau"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(GEOquery)
+library(hgu219.db)
+library(genefilter)
+library(matrixStats)
+library(data.table)
+library(survival)
+library(ggplot2)
+library(ggfortify)
+library(sl3)
+library(unihtee)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(pheatmap)
+```
+
+# Prepare the Data
+
+Where does the data come from? What kind of cancer? Treatment?
+
+## Load the Data
+
+An `ExpressionSet` object is created from Series GSE47994 data. It contains the
+expression and clinical data of 335 early-stage, triple negative breast cancer
+patients. Two hundred and two of these patients are classified as HER2+.
+
+```{r load-data, cache=TRUE}
+eset <- getGEO(
+  GEO = "GSE47994",
+  dest = here("analysis/data"),
+  GSEMatrix = TRUE,
+  getGPL = FALSE
+)[[1]]
+```
+
+These patients' expression data has already been processed using the Robust
+multi-array analysis method, followed by quantile normalization. Probe-level
+annotations were obtained from the assay manufacturer's web site.
+
+## Preprocessing 
+
+Only HER2+ patients are retained for this analyis. We also limit our analysis to
+the 500 most variable genes that are well-annotated.
+
+```{r filter-data}
+## retain only HER2+ positive patients
+eset <- eset[, pData(eset)$`her2 status:ch1` == "1"]
+
+## retain only most variable probes
+## partial probe removal (uses annotation info)
+annotation(eset) <- "hgu219" 
+eset <- nsFilter(eset)$eset
+probe_variances <- rowVars(exprs(eset))
+keep_probes <- rank(-probe_variances) <= 500
+eset <- eset[keep_probes]
+```
+
+We then replace the current feature names by their human-friendly gene symbol.
+
+```{r get-symbols}
+rownames(eset) <- as.vector(unlist(mget(rownames(eset), hgu219SYMBOL)))
+```
+
+Finally, we prepate the `data.table` object for eventual use with `unihtee()`.
+
+```{r make-data.table}
+## turn expression data into a data.table
+exprs_dt <- as.data.table(t(exprs(eset)))
+
+## extract relevant observation-level data
+obs_dt <- as.data.table(pData(eset))[,
+  `:=`(
+    age = as.numeric(`patient age (years):ch1`),
+    recurrence = as.numeric(`distant recurrence:ch1`),
+    time = as.numeric(`time to distant recurrence (years):ch1`),
+    docetaxel = as.numeric(`chemotherapy regimen:ch1` == "Docetaxel"),
+    herceptin = as.numeric(`herceptin treatment:ch1`)
+  )]
+obs_dt <- obs_dt[, c("recurrence", "time", "herceptin", "docetaxel", "age")]
+obs_dt$prop_score <- 0.5
+
+## combine the data, and retain only complete cases
+dt <- cbind(obs_dt, exprs_dt)
+dt <- dt[complete.cases(dt), ]
+```
+
+
+## Exploratory Data Analysis
+
+Plot the outcome of interest. Is the proportional hazards assumption violated?
+If not, then we can't consider the penalized cox models here. Discuss
+assumptions for RMST-based TEM-VIP assumptions.
+
+We next perform a brief exploratory data analysis. First, we ensure that the
+number of patients receiving Herceptin is approximately equal to the number of
+patients in the control arm. We further stratify by chemo regimen to assess
+balance. The treatment is approximately perfectly balanced across patients, as
+are docetaxel versus vinorelbine.
+
+```{r therapy-table}
+table("docetaxel" = dt$docetaxel, "herceptin" = dt$herceptin)
+```
+
+We now plot the Kaplan Meyer curve for DDFS.
+
+```{r KM}
+km_fit <- survfit(Surv(time, recurrence) ~ herceptin, data = dt)
+autoplot(km_fit) + 
+ labs(x = "\n Survival Time (Years) ", y = "Survival Probabilities \n")
+```
+
+It's clear from this plot that there herceptin does not provide a strong
+protective effect.
+
+# Predictive Biomarker Discovery
+
+## Apply `unihtee`
+
+Apply `unihtee` to estimate the RMST-based treatment effect modifier variable
+importance parameter. Let's use the same library of learners as in the
+simulation. Sensitivity analysis with more complicated SL library. Use the TMLE
+estimator since it was better in this setting during simulations.
+
+```{r unihtee}
+## discretize the data to be in half years, and create a censoring indicator
+dt[, `:=`(
+  discrete_time = ceiling(time * 2) / 2,
+  censoring = 1 - recurrence
+)]
+
+## define the confounders and potential treatment effect modifiers
+confounders <- c(c("age", "docetaxel"), colnames(exprs_dt))
+modifiers <- colnames(exprs_dt)
+
+## build a super learner
+lrnr_interactions <- Lrnr_define_interactions$new(
+  lapply(modifiers, function(mod) c("herceptin", mod))
+)
+lrnr_lasso_haz <- make_learner(
+  Pipeline, lrnr_interactions, Lrnr_glmnet$new()
+)
+lrnr_lasso_cens <- Lrnr_glmnet$new()
+lrnr_ranger <- Lrnr_ranger$new()
+lrnr_xgboost <- Lrnr_xgboost$new()
+
+## define the discrete super learners
+bin_metalearner <- make_learner(
+  Lrnr_solnp, metalearner_logistic_binomial, loss_squared_error
+)
+lrnr_sl_haz <- Lrnr_sl$new(
+  learners = list(
+    lrnr_lasso_haz, lrnr_ranger, lrnr_xgboost
+  ),
+  metalearner = bin_metalearner
+)
+lrnr_sl_cens <- Lrnr_sl$new(
+  learners = list(
+    lrnr_lasso_cens, lrnr_ranger, lrnr_xgboost
+  ),
+  metalearner = bin_metalearner
+)
+
+set.seed(514)
+results_tmle <- unihtee(
+  data = dt,
+  confounders = confounders,
+  modifiers = modifiers,
+  exposure = "herceptin",
+  outcome = "discrete_time",
+  censoring = "censoring",
+  time_cutoff = 6,
+  outcome_type = "time-to-event",
+  effect = "absolute",
+  estimator = "tmle",
+  prop_score_values = "prop_score",
+  failure_hazard_estimator = lrnr_sl_haz,
+  censoring_hazard_estimator = lrnr_sl_cens
+)
+```
+
+## Empirical Cumulative Distribution Function of P-Values
+
+```{r ecdf-p-values}
+results_tmle %>%
+  ggplot(aes(p_value)) +
+  stat_ecdf(pad = FALSE) +
+  geom_segment(aes(x = 0, y = 0, xend = 1, yend = 1), linetype = 2) +
+  ylim(0, 1) +
+  xlim(0, 1) +
+  xlab("Nominal P-Values") +
+  ylab("Cumulative Probability") +
+  theme_bw()
+
+ggsave(
+  "tmle-ecdf.jpeg",
+  path = here("analysis/results"),
+  scale = 1.2,
+  height = 3,
+  width = 5,
+  dpi = "retina"
+)
+```
+
+## Table of Statistically Significant Biomarkers
+
+```{r significant-genes}
+results_tmle[p_value_fdr <= 0.05] %>%
+  kbl(digits = 3) %>%
+  kable_styling
+```
+
+## Volcano Plot
+
+```{r volcano}
+results_tmle %>%
+  mutate(
+    neg_log10_p_value = -log10(p_value),
+    biomarker_cat = case_when(
+      p_value_fdr <= 0.05 & abs(estimate) > 0.05 ~ "hit",
+      p_value_fdr > 0.05 & abs(estimate) > 0.05 ~ "interesting",
+      abs(estimate) <= 0.1 ~ "uninteresting"
+    ),
+    biomarker_cat = factor(biomarker_cat,
+      levels = c("hit", "interesting", "uninteresting")
+    )
+  ) %>%
+  ggplot(aes(
+    x = estimate, y = neg_log10_p_value, colour = biomarker_cat
+  )) +
+    geom_point() +
+    geom_hline(yintercept = -log10(0.024), linetype = 2, alpha = 0.3) +
+    geom_vline(xintercept = 0.05, linetype = 2, alpha = 0.3) +
+    geom_vline(xintercept = -0.05, linetype = 2, alpha = 0.3) +
+    scale_color_manual(
+      values = c("hit" = "red", "interesting" = "orange", "uninteresting" = "yellow")
+    ) +
+    xlab("TEM-VIP Estimates") +
+    ylab("-log10(P-Value)") +
+    theme_bw() +
+    theme(legend.position = "none")
+
+ggsave(
+  "tmle-volcano.jpeg",
+  path = here("analysis/results"),
+  scale = 1.2,
+  height = 3,
+  width = 5,
+  dpi = "retina"
+)
+```
+
+## Predicted Predictive Biomarkers' Expression Heatmap
+
+A total of `r nrow(results_tmle[(abs(estimate) >= 0.05 & p_value_fdr <= 0.05)])`
+biomarkers are deemed to modify the effect of treatment in a clinically
+meaningful way.
+
+```{r heatmap, fig.width=3}
+predictive_biomarkers <- results_tmle[
+  (abs(estimate) >= 0.05 & p_value_fdr <= 0.05), modifier]
+
+## save the heatmap
+pheatmap(
+  mat = as.matrix(exprs_dt[, ..predictive_biomarkers]),
+  width = 8,
+  height = 12,
+  filename = here("analysis/results/tmle-heatmap.jpeg"),
+  border_color = NA,
+  show_rownames = FALSE,
+  show_colnames = FALSE
+)
+knitr::include_graphics(
+  here("analysis/results/tmle-heatmap.jpeg"),
+  error = FALSE
+)
+```
